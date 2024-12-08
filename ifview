@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import sys
+
+try:
+    from rich.table import Table
+    from rich.console import Console
+except ModuleNotFoundError:
+    print("The 'rich' module is not installed.\nTry installing it with:")
+    print("    apt install python3-rich -y")
+    sys.exit(1)
+
+import subprocess
+import re
+
+console = Console()
+
+def get_cmd_output(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+# Gather interface info from ip link
+ip_link_output = get_cmd_output(["ip", "-o", "link", "show"])
+if not ip_link_output:
+    console.print("[red]No output from 'ip -o link show'. Are the 'ip' commands available?[/red]")
+    sys.exit(1)
+
+interfaces_data = {}
+
+for line in ip_link_output.splitlines():
+    parts = line.split()
+    idx = parts[0]
+    iface = parts[1].rstrip(':')
+    if iface == "lo":
+        continue
+
+    mac_addr = ""
+    mac_match = re.search(r'link/ether\s+([0-9a-f:]+)', line)
+    if mac_match:
+        mac_addr = mac_match.group(1)
+
+    mtu_val = ""
+    mtu_match = re.search(r'\bmtu\s+(\d+)', line)
+    if mtu_match:
+        mtu_val = mtu_match.group(1)
+
+    state_val = ""
+    state_match = re.search(r'\bstate\s+([A-Z]+)', line)
+    if state_match:
+        state_val = state_match.group(1)
+
+    interfaces_data[iface] = {
+        "mac": mac_addr,
+        "state": state_val,
+        "mtu": mtu_val
+    }
+
+# Gather IP addresses
+ip_addr_output = get_cmd_output(["ip", "-o", "addr", "show"])
+for line in ip_addr_output.splitlines():
+    parts = line.split()
+    if len(parts) < 4:
+        continue
+    iface = parts[1]
+    fam = parts[2]
+    addr = parts[3]
+    if iface == "lo" or fam != "inet":
+        continue
+    if iface not in interfaces_data:
+        interfaces_data[iface] = {"mac":"","state":"","mtu":""}
+    if "ip" not in interfaces_data[iface]:
+        interfaces_data[iface]["ip"] = addr
+    else:
+        interfaces_data[iface]["ip"] += ", " + addr
+
+# Get models by parsing ethtool and lspci
+for iface in interfaces_data.keys():
+    model = "Unknown"
+    ethtool_out = get_cmd_output(["ethtool", "-i", iface])
+    bus_info_match = re.search(r'bus-info:\s+(\S+)', ethtool_out)
+    if bus_info_match:
+        bus_info = bus_info_match.group(1)
+        lspci_out = get_cmd_output(["lspci", "-v", "-s", bus_info])
+        model_match = re.search(r'Ethernet controller:\s+Intel Corporation Ethernet Controller\s+(.*?)(\(rev.*\)|$)', lspci_out)
+        if model_match:
+            model = model_match.group(1).strip()
+    interfaces_data[iface]["model"] = model
+
+if not interfaces_data:
+    console.print("[yellow]No interfaces found. Are there any non-lo interfaces?[/yellow]")
+    sys.exit(0)
+
+# Build single combined table
+table = Table(show_header=True, header_style="bold magenta")
+table.add_column("Interface", justify="left")
+table.add_column("MAC Address", justify="left")
+table.add_column("State", justify="left")
+table.add_column("IP Address(es)", justify="left")
+table.add_column("MTU", justify="right")
+table.add_column("Model", justify="left")
+
+for iface, data in interfaces_data.items():
+    st = data.get("state", "")
+    if st == "UP":
+        st_styled = f"[green]{st}[/green]"
+    elif st == "DOWN":
+        st_styled = f"[red]{st}[/red]"
+    else:
+        st_styled = f"[yellow]{st}[/yellow]" if st else ""
+
+    table.add_row(
+        iface,
+        data.get("mac", ""),
+        st_styled,
+        data.get("ip", ""),
+        data.get("mtu", ""),
+        data.get("model", "")
+    )
+
+console.print(table)
